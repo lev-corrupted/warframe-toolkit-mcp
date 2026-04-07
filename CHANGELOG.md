@@ -1,5 +1,29 @@
 # Warframe Toolkit — Changelog
 
+## 2026-04-07
+
+### Testing & QA
+- Added pytest test suite (`test_server.py`) — **52 tests, 100% passing**
+- Tests cover: fuzzy matching, price aggregation (bottom-5 avg), syndicate data loading,
+  Archon shard color verification, timestamp conversion, fissure filtering,
+  world state dashboard, Baro tracker, price history, market spread, dual-source fallback
+- Set up venv with pytest, pytest-mock, responses (HTTP mocking)
+- Updated `.gitignore` for `.venv/` and `.pytest_cache/`
+
+### Bug Fixes
+- **Fixed Archon shard color mappings** — were completely wrong in both DE and warframestat code paths
+  - Amar = Crimson (was Amber), Nira = Amber (was Azure), Boreal = Azure (was Crimson)
+  - Verified from wiki.warframe.com/w/Archon_Shard
+- Cleaned up section comments in server.py
+
+### Improvements
+- Added **Acrithis** (Dormizone) to `warframe_weekly_gaz_prep` weekly checklist
+  - Weekly rotating shop: Rivens, Catalysts, Reactors, Exilus Adapters, Forma, Kuva
+- Added **Yonta** (Zariman) to weekly checklist — 35,000 Kuva for 5 Voidplume Pinions
+- Removed deleted `youtube_transcript.py` from git tracking
+- Deleted `__pycache__/` directory
+- Initial commit pushed to GitHub: github.com/lev-corrupted/warframe-toolkit-mcp
+
 ## 2026-03-30
 
 ### Phase 4 — Usage Analytics & Market Intelligence (2 new tools, 16 total)
