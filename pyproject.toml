@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "warframe-toolkit-mcp"
+version = "1.0.0"
+description = "MCP server for Warframe market analysis -- syndicate profitability, price tracking, and trading insights"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    { name = "levtheswag" },
+]
+dependencies = [
+    "mcp",
+    "requests",
+]
+
+[project.urls]
+Homepage = "https://github.com/levtheswag/warframe-toolkit-mcp"
+Repository = "https://github.com/levtheswag/warframe-toolkit-mcp"
