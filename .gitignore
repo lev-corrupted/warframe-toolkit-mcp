@@ -17,6 +17,10 @@ env/
 price_history.json
 latest_scan.json
 
+# Testing
+.pytest_cache/
+.venv/
+
 # IDE
 .vscode/
 .idea/
