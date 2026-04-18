@@ -173,14 +173,36 @@ class TestFindItemSlug:
 
 
 # ============================================================
-# _quick_price TESTS
+# _quick_price TESTS — New algorithm (traded median + fallback)
 # ============================================================
 
+def _stats_payload(trades_per_day):
+    """Build fake statistics_closed payload from list of (days_ago, median, volume) tuples.
+    days_ago=0 is today, 1 is yesterday, etc.
+    """
+    from datetime import datetime, timedelta
+    entries = []
+    for days_ago, median, volume in trades_per_day:
+        dt = (datetime.utcnow() - timedelta(days=days_ago)).strftime("%Y-%m-%dT00:00:00.000+00:00")
+        entries.append({
+            "datetime": dt,
+            "avg_price": median,
+            "min_price": median - 1,
+            "max_price": median + 2,
+            "volume": volume,
+            "median": median,
+        })
+    entries.sort(key=lambda e: e["datetime"])
+    return {"payload": {"statistics_closed": {"48hours": entries[-2:] if entries else [],
+                                              "90days": entries}}}
+
+
 class TestQuickPrice:
-    """Tests for price aggregation logic."""
+    """Tests for new pricing algorithm using traded stats + fallback."""
 
     @responses.activate
-    def test_returns_bottom_5_avg(self):
+    def test_uses_7day_traded_median_when_available(self):
+        """Primary path: use median of last 7 days of actual trades."""
         server._item_cache = FAKE_ITEMS
         responses.add(
             responses.GET,
@@ -188,12 +210,124 @@ class TestQuickPrice:
             json={"data": FAKE_SELL_ORDERS},
             status=200,
         )
+        # 7 days of trades, median around 15-16
+        stats = _stats_payload([(0, 15, 5), (1, 16, 8), (2, 15, 10), (3, 14, 6),
+                                (4, 16, 7), (5, 15, 9), (6, 16, 5)])
+        responses.add(
+            responses.GET,
+            f"{server.API_V1}/items/condition_overload/statistics",
+            json=stats,
+            status=200,
+        )
         result = server._quick_price("Condition Overload")
         assert result["name"] == "Condition Overload"
-        # Bottom 5 online/ingame sellers: 10, 12, 15, 18, 20 → avg = 15
-        assert result["avg"] == 15
-        assert result["low"] == 10
-        assert result["orders"] > 0
+        assert 14 <= result["avg"] <= 17  # near traded median
+        assert result["source"] == "traded_7d"
+        assert result["liquidity"] in ("HIGH", "MED")
+        assert result["volume"] > 5  # daily average
+        assert "error" not in result or result.get("error") is None
+
+    @responses.activate
+    def test_warns_when_listed_avg_differs_from_traded(self):
+        """If listings show 47p but trades show 18p, emit warning."""
+        server._item_cache = FAKE_ITEMS
+        # Order book shows inflated prices (holdouts at 48, 74, 74)
+        holdout_orders = [
+            {"type": "sell", "platinum": 14, "quantity": 1, "user": {"ingameName": "L1", "status": "online"}},
+            {"type": "sell", "platinum": 25, "quantity": 1, "user": {"ingameName": "L2", "status": "online"}},
+            {"type": "sell", "platinum": 48, "quantity": 1, "user": {"ingameName": "L3", "status": "online"}},
+            {"type": "sell", "platinum": 74, "quantity": 1, "user": {"ingameName": "L4", "status": "online"}},
+            {"type": "sell", "platinum": 74, "quantity": 1, "user": {"ingameName": "L5", "status": "online"}},
+        ]
+        responses.add(
+            responses.GET,
+            f"{server.API_BASE}/orders/item/condition_overload",
+            json={"data": holdout_orders},
+            status=200,
+        )
+        # But actual trades happen at 18p
+        stats = _stats_payload([(0, 18, 4), (1, 17, 5), (2, 18, 6), (3, 19, 4),
+                                (4, 17, 3), (5, 18, 5), (6, 17, 4)])
+        responses.add(
+            responses.GET,
+            f"{server.API_V1}/items/condition_overload/statistics",
+            json=stats,
+            status=200,
+        )
+        result = server._quick_price("Condition Overload")
+        # Should use traded median (~18p), not listed bottom-3 avg (~29p)
+        assert 16 <= result["avg"] <= 20
+        assert result["warning"] is not None
+        assert "listed" in result["warning"].lower() or "differ" in result["warning"].lower()
+
+    @responses.activate
+    def test_fallback_to_orderbook_when_no_trades(self):
+        """If no trade data available, fall back to bottom-3 online sellers."""
+        server._item_cache = FAKE_ITEMS
+        responses.add(
+            responses.GET,
+            f"{server.API_BASE}/orders/item/condition_overload",
+            json={"data": FAKE_SELL_ORDERS},
+            status=200,
+        )
+        # Stats API returns empty (no trades)
+        empty_stats = {"payload": {"statistics_closed": {"48hours": [], "90days": []}}}
+        responses.add(
+            responses.GET,
+            f"{server.API_V1}/items/condition_overload/statistics",
+            json=empty_stats,
+            status=200,
+        )
+        result = server._quick_price("Condition Overload")
+        assert result["source"] == "orderbook"
+        assert result["liquidity"] == "LOW"
+        assert result["warning"] is not None
+        # Bottom 3 online sellers: 10, 12, 15 → avg around 12
+        assert 10 <= result["avg"] <= 16
+
+    @responses.activate
+    def test_dead_mod_no_data(self):
+        """If no trades AND no sellers, return error/DEAD status."""
+        server._item_cache = FAKE_ITEMS
+        responses.add(
+            responses.GET,
+            f"{server.API_BASE}/orders/item/condition_overload",
+            json={"data": []},
+            status=200,
+        )
+        empty_stats = {"payload": {"statistics_closed": {"48hours": [], "90days": []}}}
+        responses.add(
+            responses.GET,
+            f"{server.API_V1}/items/condition_overload/statistics",
+            json=empty_stats,
+            status=200,
+        )
+        result = server._quick_price("Condition Overload")
+        assert result["avg"] == 0
+        assert result["source"] == "none"
+        assert result["liquidity"] == "DEAD"
+
+    @responses.activate
+    def test_liquidity_tiers(self):
+        """HIGH (10+/day), MED (3-9/day), LOW (<3/day)."""
+        server._item_cache = FAKE_ITEMS
+        responses.add(
+            responses.GET,
+            f"{server.API_BASE}/orders/item/condition_overload",
+            json={"data": FAKE_SELL_ORDERS},
+            status=200,
+        )
+        # HIGH: 15/day avg over 7 days = 105 total
+        high_stats = _stats_payload([(i, 15, 15) for i in range(7)])
+        responses.add(
+            responses.GET,
+            f"{server.API_V1}/items/condition_overload/statistics",
+            json=high_stats,
+            status=200,
+        )
+        result = server._quick_price("Condition Overload")
+        assert result["liquidity"] == "HIGH"
+        assert result["volume"] >= 10
 
     @responses.activate
     def test_not_found_item(self):
@@ -201,20 +335,6 @@ class TestQuickPrice:
         result = server._quick_price("Totally Fake Item")
         assert result["error"] == "not found"
         assert result["avg"] == 0
-
-    @responses.activate
-    def test_no_sell_orders(self):
-        server._item_cache = FAKE_ITEMS
-        buy_only = [o for o in FAKE_SELL_ORDERS if o["type"] == "buy"]
-        responses.add(
-            responses.GET,
-            f"{server.API_BASE}/orders/item/condition_overload",
-            json={"data": buy_only},
-            status=200,
-        )
-        result = server._quick_price("Condition Overload")
-        assert result["avg"] == 0
-        assert result["orders"] == 0
 
     @responses.activate
     def test_api_error_handled(self):
@@ -225,8 +345,35 @@ class TestQuickPrice:
             json={"error": "server error"},
             status=500,
         )
+        responses.add(
+            responses.GET,
+            f"{server.API_V1}/items/condition_overload/statistics",
+            json={"error": "server error"},
+            status=500,
+        )
         result = server._quick_price("Condition Overload")
-        assert "error" in result
+        assert "error" in result or result.get("avg") == 0
+
+    @responses.activate
+    def test_returns_low_price_for_undercut(self):
+        """`low` field should always show lowest online listing (for undercut pricing)."""
+        server._item_cache = FAKE_ITEMS
+        responses.add(
+            responses.GET,
+            f"{server.API_BASE}/orders/item/condition_overload",
+            json={"data": FAKE_SELL_ORDERS},
+            status=200,
+        )
+        stats = _stats_payload([(i, 15, 10) for i in range(7)])
+        responses.add(
+            responses.GET,
+            f"{server.API_V1}/items/condition_overload/statistics",
+            json=stats,
+            status=200,
+        )
+        result = server._quick_price("Condition Overload")
+        # Lowest online/ingame seller = 10p
+        assert result["low"] == 10
 
 
 # ============================================================

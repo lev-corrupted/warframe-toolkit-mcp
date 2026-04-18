@@ -110,40 +110,161 @@ def _get_syndicate_mods(syndicate_name: str) -> list[str]:
     return mods
 
 
+def _fetch_statistics(slug: str) -> dict:
+    """Fetch v1 /statistics endpoint for a slug. Returns {} on failure."""
+    try:
+        res = requests.get(f"{API_V1}/items/{slug}/statistics",
+                           headers=HEADERS, timeout=10)
+        if res.status_code != 200:
+            return {}
+        return res.json().get("payload", {}).get("statistics_closed", {})
+    except Exception:
+        return {}
+
+
+def _traded_median_from_stats(stats: dict, days: int = 7):
+    """Compute volume-weighted median of traded prices over last N days.
+    Returns (median_price, avg_daily_volume) or (None, 0) if insufficient data.
+    """
+    entries = stats.get("90days", []) or []
+    if not entries:
+        return (None, 0)
+    # Last N daily entries (api returns chronologically sorted)
+    recent = entries[-days:]
+    total_vol = sum(e.get("volume", 0) for e in recent)
+    if total_vol < 5:  # need at least 5 trades in window
+        return (None, total_vol / max(len(recent), 1))
+
+    # Volume-weighted median of daily medians
+    # Expand: treat each daily median as weighted by its volume
+    weighted = []
+    for e in recent:
+        median = e.get("median", e.get("avg_price", 0))
+        vol = e.get("volume", 0)
+        weighted.extend([median] * int(vol))
+    if not weighted:
+        return (None, 0)
+    weighted.sort()
+    mid = len(weighted) // 2
+    if len(weighted) % 2 == 0:
+        median_price = (weighted[mid - 1] + weighted[mid]) / 2
+    else:
+        median_price = weighted[mid]
+    avg_daily_volume = total_vol / len(recent)
+    return (median_price, avg_daily_volume)
+
+
+def _liquidity_tier(avg_daily_volume: float) -> str:
+    """Map daily volume to a liquidity label."""
+    if avg_daily_volume >= 10:
+        return "HIGH"
+    if avg_daily_volume >= 3:
+        return "MED"
+    if avg_daily_volume > 0:
+        return "LOW"
+    return "DEAD"
+
+
 def _quick_price(item_name: str) -> dict:
-    """Get quick price data for an item. Returns {name, low, avg, orders}."""
+    """Get accurate price for an item.
+
+    Priority:
+      1. Volume-weighted median of last 7 days of actual trades (source='traded_7d')
+      2. Fallback: bottom-3 online sellers avg (source='orderbook') with warning
+      3. DEAD: no trades + no sellers (source='none')
+
+    Returns:
+      {
+        name, avg, low, orders,
+        volume (daily avg), liquidity ('HIGH'|'MED'|'LOW'|'DEAD'),
+        source ('traded_7d'|'orderbook'|'none'),
+        warning (str or None),
+        error (str or None)
+      }
+    """
     slug, matched_name = _find_item_slug(item_name)
     if not slug:
-        return {"name": item_name, "low": 0, "avg": 0, "orders": 0, "error": "not found"}
+        return {"name": item_name, "low": 0, "avg": 0, "orders": 0,
+                "volume": 0, "liquidity": "DEAD", "source": "none",
+                "warning": None, "error": "not found"}
 
+    # 1. Fetch both order book and statistics in parallel (sequential is fine here)
+    order_err = None
+    sell_orders = []
     try:
         res = requests.get(f"{API_BASE}/orders/item/{slug}", headers=HEADERS, timeout=10)
-        res.raise_for_status()
-        data = res.json()["data"]
-
-        if isinstance(data, list):
-            sell_orders = [o for o in data if o.get("type") == "sell"
-                           and o.get("user", {}).get("status") in ("ingame", "online")]
-            if not sell_orders:
-                sell_orders = [o for o in data if o.get("type") == "sell"]
+        if res.status_code == 200:
+            data = res.json().get("data", [])
+            if isinstance(data, list):
+                sell_orders = [o for o in data if o.get("type") == "sell"
+                               and o.get("user", {}).get("status") in ("ingame", "online")]
+                if not sell_orders:
+                    sell_orders = [o for o in data if o.get("type") == "sell"]
         else:
-            sell_orders = []
-
-        if sell_orders:
-            sell_orders.sort(key=lambda x: x.get("platinum", 999999))
-            # Average the bottom 5 online sellers — closest to actual trade prices
-            # (median and top-10 avg both inflate due to overpriced listings)
-            prices = [o.get("platinum", 0) for o in sell_orders[:5]]
-            avg = round(sum(prices) / len(prices))
-            return {
-                "name": matched_name,
-                "low": prices[0],
-                "avg": avg,
-                "orders": len(sell_orders),
-            }
-        return {"name": matched_name, "low": 0, "avg": 0, "orders": 0}
+            order_err = f"orders api {res.status_code}"
     except Exception as e:
-        return {"name": matched_name or item_name, "low": 0, "avg": 0, "orders": 0, "error": str(e)}
+        order_err = str(e)
+
+    stats = _fetch_statistics(slug)
+
+    # Low price from order book (for undercut reference)
+    low_price = 0
+    if sell_orders:
+        sell_orders.sort(key=lambda x: x.get("platinum", 999999))
+        low_price = sell_orders[0].get("platinum", 0)
+
+    # Listed avg of bottom 3 (for warning comparison)
+    listed_avg = 0
+    if sell_orders:
+        bottom_3 = [o.get("platinum", 0) for o in sell_orders[:3]]
+        listed_avg = sum(bottom_3) / len(bottom_3)
+
+    # 2. Primary: traded median from last 7 days
+    traded_median, avg_daily_vol = _traded_median_from_stats(stats, days=7)
+
+    if traded_median is not None:
+        warning = None
+        # Warning if listed avg >> traded median (stale holdouts)
+        if listed_avg > 0 and traded_median > 0:
+            diff_ratio = abs(listed_avg - traded_median) / traded_median
+            if diff_ratio > 0.3:
+                warning = (f"Listed avg {listed_avg:.0f}p differs from traded "
+                           f"median {traded_median:.0f}p — list near {int(max(low_price, traded_median - 1))}p")
+        return {
+            "name": matched_name,
+            "avg": round(traded_median),
+            "low": low_price,
+            "orders": len(sell_orders),
+            "volume": round(avg_daily_vol, 1),
+            "liquidity": _liquidity_tier(avg_daily_vol),
+            "source": "traded_7d",
+            "warning": warning,
+            "error": None,
+        }
+
+    # 3. Fallback: bottom-3 online sellers
+    if sell_orders and len(sell_orders) >= 1:
+        n = min(3, len(sell_orders))
+        bottom_n_prices = [o.get("platinum", 0) for o in sell_orders[:n]]
+        fallback_avg = sum(bottom_n_prices) / len(bottom_n_prices)
+        return {
+            "name": matched_name,
+            "avg": round(fallback_avg),
+            "low": low_price,
+            "orders": len(sell_orders),
+            "volume": 0,
+            "liquidity": "LOW",
+            "source": "orderbook",
+            "warning": "no recent trades — price estimated from listings only",
+            "error": None,
+        }
+
+    # 4. Dead: no data at all
+    return {
+        "name": matched_name, "avg": 0, "low": 0, "orders": 0,
+        "volume": 0, "liquidity": "DEAD", "source": "none",
+        "warning": "no trades and no listings", "error": order_err,
+    }
 
 
 def _save_price_history(syndicate: str, prices: list[dict]):
@@ -273,17 +394,28 @@ def price_check_multiple(item_names: str) -> str:
     """
     names = [n.strip() for n in item_names.split(",") if n.strip()]
     results = []
+    icon_map = {"HIGH": "🟢", "MED": "🟡", "LOW": "🟠", "DEAD": "⚫"}
 
     for name in names:
         p = _quick_price(name)
-        if p.get("error"):
+        if p.get("error") == "not found":
             results.append(f"- **{name}** — Not found")
-        elif p["orders"] > 0:
-            results.append(f"- **{p['name']}** — Low: {p['low']}p | Avg: {p['avg']}p | {p['orders']} orders")
-        else:
-            results.append(f"- **{p['name']}** — No active orders")
+            continue
+        if p["avg"] == 0:
+            results.append(f"- **{p['name']}** — No trades or sellers")
+            continue
+        icon = icon_map.get(p.get("liquidity", ""), "")
+        src = p.get("source", "")
+        src_tag = " (listings only)" if src == "orderbook" else ""
+        warn = " ⚠️" if p.get("warning") else ""
+        results.append(
+            f"- **{p['name']}**{warn} — Median: {p['avg']}p | Low: {p['low']}p | "
+            f"Vol: {p.get('volume', 0)}/d {icon} | Sellers: {p['orders']}{src_tag}"
+        )
 
-    return "**Multi-Item Price Check:**\n\n" + "\n".join(results)
+    lines = ["**Multi-Item Price Check:** (7-day traded median)"]
+    lines.extend(results)
+    return "\n".join(lines)
 
 
 @mcp.tool()
@@ -436,7 +568,7 @@ def syndicate_lookup(syndicate_name: str) -> str:
     # Sort by avg price descending
     priced.sort(key=lambda x: x["avg"], reverse=True)
 
-    lines = [f"**{matched_key}** — {len(priced)} mods (verified from wiki)\n"]
+    lines = [f"**{matched_key}** — {len(priced)} mods (traded median, last 7d)\n"]
 
     # Split into tiers
     rare = [p for p in priced if p["avg"] >= 20]
@@ -444,35 +576,57 @@ def syndicate_lookup(syndicate_name: str) -> str:
     common = [p for p in priced if 10 <= p["avg"] < 15]
     cheap = [p for p in priced if p["avg"] < 10]
 
+    def liq_icon(p):
+        tier = p.get("liquidity", "?")
+        return {"HIGH": "🟢", "MED": "🟡", "LOW": "🟠", "DEAD": "⚫"}.get(tier, "❓")
+
+    def row(p):
+        flag = " ⚠️" if p.get("warning") else ""
+        src = p.get("source", "?")
+        vol = p.get("volume", 0)
+        return (f"| {p['name']}{flag} | {p['avg']}p | {p['low']}p | "
+                f"{vol}/d {liq_icon(p)} | {p['orders']} | {p['warframe']} |")
+
+    def table_header():
+        return (["| Mod | Median | Low | Vol | Sellers | Frame |",
+                 "|-----|--------|-----|-----|---------|-------|"])
+
     if rare:
         lines.append("**RARE SELLS (20p+):**")
-        lines.append("| Mod | Avg | Low | Orders | Frame |")
-        lines.append("|-----|-----|-----|--------|-------|")
-        for p in rare:
-            lines.append(f"| {p['name']} | {p['avg']}p | {p['low']}p | {p['orders']} | {p['warframe']} |")
+        lines.extend(table_header())
+        for p in rare: lines.append(row(p))
 
     if good:
         lines.append("\n**CONSISTENT (15-19p):**")
-        lines.append("| Mod | Avg | Low | Orders | Frame |")
-        lines.append("|-----|-----|-----|--------|-------|")
-        for p in good:
-            lines.append(f"| {p['name']} | {p['avg']}p | {p['low']}p | {p['orders']} | {p['warframe']} |")
+        lines.extend(table_header())
+        for p in good: lines.append(row(p))
 
     if common:
         lines.append("\n**QUICK SELLS (10-14p):**")
-        lines.append("| Mod | Avg | Low | Orders | Frame |")
-        lines.append("|-----|-----|-----|--------|-------|")
-        for p in common:
-            lines.append(f"| {p['name']} | {p['avg']}p | {p['low']}p | {p['orders']} | {p['warframe']} |")
+        lines.extend(table_header())
+        for p in common: lines.append(row(p))
 
     if cheap:
         lines.append(f"\n**LOW VALUE (<10p):** {', '.join(p['name'] + ' (' + str(p['avg']) + 'p)' for p in cheap)}")
+
+    # Warnings summary — show stale-listing mods
+    warnings = [p for p in priced if p.get("warning") and p["avg"] >= 10]
+    if warnings:
+        lines.append("\n**⚠️ Stale Listings Detected** (listed avg differs from actual traded median):")
+        for p in warnings[:10]:
+            lines.append(f"- **{p['name']}**: {p['warning']}")
 
     # Summary
     all_avg = [p["avg"] for p in priced if p["avg"] > 0]
     if all_avg:
         top5 = sorted(all_avg, reverse=True)[:5]
-        lines.append(f"\n**Summary:** Avg all={sum(all_avg)/len(all_avg):.1f}p | Top 5 avg={sum(top5)/5:.1f}p | 20p+ mods={len(rare)}")
+        high_liq = sum(1 for p in priced if p.get("liquidity") == "HIGH")
+        med_liq = sum(1 for p in priced if p.get("liquidity") == "MED")
+        lines.append(f"\n**Summary:** Avg all={sum(all_avg)/len(all_avg):.1f}p | "
+                     f"Top 5 avg={sum(top5)/5:.1f}p | 20p+ mods={len(rare)} | "
+                     f"🟢High liq={high_liq} 🟡Med={med_liq}")
+    lines.append("\n*Prices = volume-weighted median of actual trades last 7d. "
+                 "⚠️ = listings inflated above real market. List near 'Low' to sell fast.*")
 
     return "\n".join(lines)
 
